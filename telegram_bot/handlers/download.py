@@ -1,0 +1,118 @@
+from aiogram import Router, types
+from aiogram.exceptions import TelegramBadRequest
+from loguru import logger
+
+from ..db import send_event, get_track, save_track, check_favorite
+from ..constants import MAX_TG_UPLOAD
+from ..config import BOT_LINK
+from ..keyboards import get_download_kb
+from ..middlewares import YAMServiceMiddleware
+from ..services import YAMService, get_lyrics_service
+from ..texts import MUSIC_CAPTION_TEXT
+from ..utils import show_advert
+
+router = Router()
+router.callback_query.middleware(YAMServiceMiddleware())
+
+
+@router.callback_query(lambda cb: cb.data.startswith('download'))
+async def download_track(cb: types.CallbackQuery, yam_service: YAMService) -> None:
+    """Обработчик для скачивания треков."""
+    logger.info(f'Пользователь {cb.from_user.id} инициировал скачивание: {cb.data!r}')
+    await send_event(event_type=2, chat_id=cb.from_user.id)  # 2 = DOWNLOAD
+    await cb.answer('Скачиваю трек...')
+    await cb.bot.send_chat_action(chat_id=cb.from_user.id, action='upload_document')
+    track_id = cb.data.split(':')[-2]
+    artist_id = cb.data.split(':')[-1]
+
+    try:
+        is_favorite = await check_favorite(cb.from_user.id, track_id)
+        cached_track = await get_track(track_id)
+        if cached_track and (file_id := cached_track.get('file_id', None)):
+            try:
+                await cb.message.answer_audio(
+                    audio=file_id,
+                    reply_markup=get_download_kb(track_id, artist_id, is_favorite),
+                    caption=MUSIC_CAPTION_TEXT,
+                )
+                await show_advert(cb.from_user.id)
+                return
+            except TelegramBadRequest as e:
+                logger.info(f'file_id недействителен у трека {track_id}: {e}')
+
+        artist, title, audio, cover = await yam_service.download_track(track_id)
+        if len(audio.data) > MAX_TG_UPLOAD:
+            await cb.message.answer('Файл трека слишком большой для отправки.')
+            return
+        msg = await cb.message.answer_audio(
+            audio=audio,
+            performer=artist,
+            title=title,
+            thumbnail=cover,
+            reply_markup=get_download_kb(track_id, artist_id, is_favorite),
+            caption=MUSIC_CAPTION_TEXT,
+        )
+        await save_track(
+            track_id=track_id,
+            file_id=msg.audio.file_id,
+            artist_id=artist_id,
+            artist_name=artist,
+            track_title=title,
+        )
+        await show_advert(cb.from_user.id)
+    except Exception:
+        logger.exception(
+            f'Ошибка при скачивании трека {track_id} для пользователя {cb.from_user.id}'
+        )
+        await cb.message.answer('Не удалось скачать трек. Попробуйте позже.')
+
+
+@router.callback_query(lambda cb: cb.data.startswith('get_lyrics'))
+async def get_lyrics(cb: types.CallbackQuery, yam_service: YAMService) -> None:
+    """Обработчик для получения текста песни."""
+    logger.info(f'Пользователь {cb.from_user.id} запросил текст песни: {cb.data!r}')
+    await cb.answer('Ищу текст песни...')
+
+    track_id = cb.data.split(':')[-1]
+
+    try:
+        # Получаем информацию о треке для отображения названия
+        track_info = await yam_service.get_track_info(track_id)
+        track_name = track_info[0]
+
+        # Получаем сервис для получения текстов
+        lyrics_service = get_lyrics_service()
+
+        # Получаем текст песни
+        lyrics = await lyrics_service.get_lyrics(track_id, yam_service.client)
+        if lyrics:
+            max_length = 4000
+            if len(lyrics) > max_length:
+                lyrics = lyrics[:max_length] + '\n\n... (текст обрезан)'
+            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text='❌', callback_data='delete_lyrics')]]
+            )
+            bot_link = BOT_LINK or 'https://t.me/search_muzyka_bot?start=ref'
+            response_text = f'{lyrics}\n\n<a href="{bot_link}">Все текста — в одном боте</a>'
+            await cb.message.answer(
+                text=response_text,
+                reply_markup=kb,
+                parse_mode='HTML'
+            )
+        else:
+            await cb.message.answer(
+                text=f'😔 К сожалению, текст песни "{track_name}" не найден.'
+            )
+    except Exception:
+        logger.exception(
+            f'Ошибка при получении текста песни {track_id} для пользователя {cb.from_user.id}'
+        )
+        await cb.message.answer('Не удалось получить текст песни. Попробуйте позже.')
+
+
+@router.callback_query(lambda cb: cb.data == 'delete_lyrics')
+async def delete_lyrics_message(cb: types.CallbackQuery):
+    """Удаляет сообщение с текстом песни."""
+    await cb.message.delete()
+    await cb.answer()
