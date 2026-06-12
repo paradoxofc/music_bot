@@ -23,8 +23,22 @@ def get_download_kb(
         )
     kb.append(
         [InlineKeyboardButton(
+            text='📜 Текст',
+            callback_data=f'get_lyrics:{track_id}',
+        )]
+    )
+    kb.append(
+        [InlineKeyboardButton(
             text='🔎 Все треки исполнителя',
             callback_data=f'artist_search:{artist_id}:0'
         )]
     )
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def get_lyrics_not_found_kb(channel_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text='Сообщить об ошибке', url=channel_url)],
+        ]
+    )

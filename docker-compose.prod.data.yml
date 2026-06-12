@@ -1,26 +1,12 @@
-name: music-bot-main
+# Сервер данных (SSH_HOST): PostgreSQL + Redis.
+# Открой порты 5432/6379 только для IP сервера с ботом (ufw allow from BOT_IP).
+name: music-bot-data
 
 networks:
   app:
     driver: bridge
 
 services:
-  bot:
-    build: .
-    command: /app/wait-for-db.sh make run.bot
-    restart: always
-    volumes:
-      - .:/app
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    env_file:
-      - .env
-    networks:
-      - app
-
   db:
     image: postgres:16
     restart: always
@@ -30,23 +16,37 @@ services:
       - .env
     networks:
       - app
+    ports:
+      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   redis:
     image: redis:8.0-alpine
     restart: unless-stopped
     networks:
       - app
+    ports:
+      - "6379:6379"
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 3s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   pgdata:

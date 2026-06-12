@@ -1,42 +1,44 @@
-from ..config import BOT_LINK
+import html
+import os
+
+DEFAULT_BOT_LINK = 'https://t.me/search_muzyka_bot?start=ref'
+
+
+def get_bot_link() -> str:
+    """Актуальная ссылка на бота (читается из env при каждом вызове)."""
+    link = (os.getenv('BOT_LINK') or DEFAULT_BOT_LINK).strip()
+    # Защита от опечатки вида BOT_LINK=https://... в .env
+    if link.startswith('BOT_LINK='):
+        link = link.removeprefix('BOT_LINK=').strip()
+    return link
+
+
+def get_music_caption() -> str:
+    """Подпись к аудио с кликабельной ссылкой (HTML)."""
+    safe_link = html.escape(get_bot_link(), quote=True)
+    return f'🎧 <a href="{safe_link}">Любимая музыка — в одном боте</a>'
+
 
 MAIN_TEXT = """
-🤖 <b>Добро пожаловать!</b>
+👋 <b>Добро пожаловать!</b>
 
-🔎 <b>Ищи треки по</b>:
-• Исполнителю  
-• Альбому  
-• Названию песни
+Отправь в чат <b>название трека</b> или <b>исполнителя</b>.
 
-🎧 <b>Открывай подборки</b>:
-• Для спорта 🏋️  
-• В дорогу 🚗  
-• Для учёбы и работы 📚
-
-⭐️ Добавляй треки в избранное и возвращайся к ним в любое время!
+⭐️ Понравившиеся песни добавляй в избранное.
 """
 
 NONE_FAVORITES_TEXT = """
-У вас пока нет избранных треков.
-Добавьте понравившиеся — и они появятся здесь ⭐
+У вас нет избранных треков.
+Нажмите ⭐️ на кнопке под песней, чтобы добавить её сюда.
 """
 
 FAVORITES_TEXT = """
-⭐ <b>Ваши избранные треки</b>:
+⭐️ <b>Ваше Избранное</b>
 """
 
 TOP_CHAT_TEXT = """
-🎧 <b>Вот что сейчас в топе</b>
-
-Выбери трек — наслаждайся!
+🔥 <b>Чарт недели</b>
 """
 
-MUSIC_CAPTION_TEXT = """
-🎧 <a href=\"{bot_link}?start=ref\">Вся музыка — в одном боте</a>
-""".format(bot_link=BOT_LINK or 'https://t.me/search_muzyka_bot?start=ref')
-
-PLAYLISTS_TEXT = """
-🤔 <b>Что слушаем сегодня? </b>
-
-Выбирай подборку — отправлю 5 случайных треков!
-"""
+# Обратная совместимость; для новых вызовов используйте get_music_caption().
+MUSIC_CAPTION_TEXT = get_music_caption()

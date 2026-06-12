@@ -1,0 +1,53 @@
+name: CI/CD for Telegram Bot
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests
+        run: make test
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add SSH known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${{ secrets.SSH_HOST2 }}" >> ~/.ssh/known_hosts
+
+      - name: Copy deploy script to servers
+        run: |
+          scp ./deploy.sh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/deploy.sh
+          scp ./deploy.sh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST2 }}:/tmp/deploy.sh
+
+      - name: Run deploy on data server (PostgreSQL + Redis)
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} 'DEPLOY_ROLE=data bash /tmp/deploy.sh'
+
+      - name: Run deploy on app server (bot)
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST2 }} 'DEPLOY_ROLE=bot bash /tmp/deploy.sh'

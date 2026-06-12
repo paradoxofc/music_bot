@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from aiogram import F, types
@@ -6,16 +7,20 @@ from aiogram.fsm.state import State, StatesGroup
 from loguru import logger
 
 from .main import router
+from ...constants import EventType
 from ...db import (
     create_broadcast,
     get_broadcast,
+    get_broadcasts_summary,
     list_broadcasts,
+    send_event,
     set_broadcast_buttons,
     update_broadcast,
     get_db,
     release_db,
 )
 from ...keyboards import back_to_admin_button, get_admin_main_kb, get_broadcast_retrieve_kb, get_broadcasts_kb
+from ...validators import is_safe_http_url
 from ...texts import (
     ADMIN_MAIN_TEXT,
     BROADCASTS_MAIN_TEXT,
@@ -68,7 +73,12 @@ async def broadcasts_list(cb: types.CallbackQuery) -> None:
     page_raw = cb.data.split(':')[-1]
     page = int(page_raw) if page_raw.isdigit() else 1
     broadcasts = await list_broadcasts(page)
-    await cb.message.edit_text(text=BROADCASTS_MAIN_TEXT, reply_markup=get_broadcasts_kb(broadcasts))
+    summary = await get_broadcasts_summary()
+    text = BROADCASTS_MAIN_TEXT.format(
+        total=summary['total'],
+        sent=summary['sent'],
+    )
+    await cb.message.edit_text(text=text, reply_markup=get_broadcasts_kb(broadcasts))
 
 
 @router.callback_query(lambda c: c.data == 'broadcast:add')
@@ -211,8 +221,8 @@ async def edit_broadcast_buttons_receive(msg: types.Message, state: FSMContext) 
                 continue
             btn_text = left.strip()
             btn_url = right.strip()
-            if btn_text and btn_url and (btn_url.startswith('http://') or btn_url.startswith('https://')):
-                buttons.append({'text': btn_text, 'url': btn_url})
+            if btn_text and btn_url and is_safe_http_url(btn_url):
+                buttons.append({'text': btn_text, 'url': btn_url.strip()})
             elif btn_text or btn_url:
                 invalid_lines.append(line)
     if invalid_lines:
@@ -233,6 +243,10 @@ async def send_broadcast(cb: types.CallbackQuery) -> None:
     broadcast = await get_broadcast(broadcast_id)
     if not broadcast:
         await cb.answer('Рассылка не найдена', show_alert=True)
+        return
+
+    if broadcast.get('is_sent'):
+        await cb.answer('Рассылка уже была отправлена', show_alert=True)
         return
 
     if target == 'all':
@@ -259,6 +273,9 @@ async def send_to_all_confirm(cb: types.CallbackQuery) -> None:
     if not broadcast:
         await cb.answer('Рассылка не найдена', show_alert=True)
         return
+    if broadcast.get('is_sent'):
+        await cb.answer('Рассылка уже была отправлена', show_alert=True)
+        return
 
     sent = 0
     failed = 0
@@ -273,11 +290,14 @@ async def send_to_all_confirm(cb: types.CallbackQuery) -> None:
         try:
             await _send_broadcast_message(cb.bot, chat_id, broadcast)
             sent += 1
+            await asyncio.sleep(0.05)
         except Exception as e:
             failed += 1
             logger.warning(f'Не удалось отправить рассылку {broadcast_id} пользователю {chat_id}: {e}')
 
     await update_broadcast(broadcast_id, {'is_sent': True})
+    if sent > 0:
+        await send_event(event_type=EventType.BROADCAST, chat_id=cb.from_user.id)
     await cb.answer(text=f'Готово: отправлено {sent}, ошибок {failed}', show_alert=True)
     await cb.message.edit_text(
         text=ADMIN_MAIN_TEXT.format(name=cb.from_user.full_name),

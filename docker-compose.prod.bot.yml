@@ -1,0 +1,22 @@
+# Сервер приложения (SSH_HOST2): только бот.
+# В .env укажи POSTGRES_HOST и REDIS_URL на IP сервера данных.
+name: music-bot-app
+
+networks:
+  app:
+    driver: bridge
+
+services:
+  bot:
+    build: .
+    command: /app/wait-for-db.sh make run.bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

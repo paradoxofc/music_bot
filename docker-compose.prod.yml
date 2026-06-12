@@ -1,22 +1,28 @@
+name: music-bot-main
+
+networks:
+  app:
+    driver: bridge
+
 services:
-  backend:
+  bot:
     build: .
-    # Используем скрипт ожидания БД в качестве команды запуска
-    command: /app/wait-for-db.sh make run.server.prod
+    command: /app/wait-for-db.sh make run.bot
     restart: unless-stopped
-    ports:
-      - "8000:8000"
-    env_file: .env
-    volumes:
-      # Удален db_volume, так как используется сетевой сервис PostgreSQL
-      - static_volume:/app/backend/staticfiles
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - app
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    depends_on:
-      - db # Явно указываем зависимость от сервиса базы данных
 
   db:
     image: postgres:16
@@ -25,51 +31,14 @@ services:
       - pgdata:/var/lib/postgresql/data
     env_file:
       - .env
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # !!! ИСПРАВЛЕННЫЙ СЕРВИС CELERY !!!
-  celery:
-    build: .
-    command: make celery
-    restart: always # Убрано дублирование этой строки
-    volumes:
-      # Правильный отступ и дефис перед элементом списка
-      - static_volume:/app/backend/staticfiles
-    depends_on:
-      - backend
-      - redis
-    env_file:
-      - .env
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  bot:
-    build: .
-    command: make run.bot
-    restart: always
-    depends_on:
-      - backend
-      - redis
-    env_file: .env
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  collectstatic:
-    build: .
-    command: make collectstatic
-    env_file: .env
-    volumes:
-      - static_volume:/app/backend/staticfiles
+    networks:
+      - app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     logging:
       driver: json-file
       options:
@@ -79,6 +48,8 @@ services:
   redis:
     image: redis:8.0-alpine
     restart: unless-stopped
+    networks:
+      - app
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
@@ -91,6 +62,4 @@ services:
         max-file: "3"
 
 volumes:
-  static_volume:
-  db_volume:
   pgdata:

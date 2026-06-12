@@ -1,4 +1,4 @@
-from aiogram import Router, types
+from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -27,43 +27,48 @@ async def search_command(msg: types.Message, state: FSMContext) -> None:
 
 @router.message(SearchState.waiting_for_query)
 async def search_query(msg: types.Message, state: FSMContext, yam_service: YAMService) -> None:
-    """Поиск треков по запросу."""
-    query = msg.text.strip()
+    """Поиск треков по запросу (после команды /search)."""
+    await _do_search(msg, msg.text.strip(), yam_service)
+    await state.clear()
+
+
+@router.message(F.text)
+async def search_free_text(msg: types.Message, yam_service: YAMService) -> None:
+    """Поиск треков по любому текстовому сообщению."""
+    await _do_search(msg, msg.text.strip(), yam_service)
+
+
+async def _do_search(msg: types.Message, query: str, yam_service: YAMService) -> None:
+    """Общая логика поиска."""
     if not query:
         await msg.answer('Пожалуйста, введите текст для поиска.')
         return
-    
+
     logger.info(f'Пользователь {msg.from_user.id} ищет: {query!r}')
-    await send_event(event_type=1, chat_id=msg.from_user.id)  # 1 = SEARCH
-    
-    await state.clear()
-    
-    # Отправляем уведомление о поиске
+    await send_event(event_type=1, chat_id=msg.from_user.id)
+
     searching_msg = await msg.answer('🔍 Ищу...')
-    
+
     try:
-        # Выполняем поиск
         results = await yam_service.search(query)
-        
+
         if not results:
             await searching_msg.delete()
             await msg.answer('😔 Ничего не найдено. Попробуйте изменить запрос.')
             return
-        
-        # Отправляем результаты
+
         await searching_msg.delete()
-        
-        # Показываем первые 10 результатов
+
         kb = get_search_kb(results)
         if not kb:
             await msg.answer('😔 Ничего не найдено. Попробуйте изменить запрос.')
             return
-            
+
         await msg.answer(
             f'🔍 Результаты поиска по запросу "{query}":',
             reply_markup=kb
         )
-        
+
     except Exception as e:
         logger.exception(f'Ошибка при поиске: {e}')
         await searching_msg.delete()
@@ -75,7 +80,11 @@ async def search_callback(cb: types.CallbackQuery, yam_service: YAMService) -> N
     """Обработчик пагинации поиска."""
     payload, page_raw = cb.data.rsplit(':', 1)
     query = payload.removeprefix('search:')
-    page = int(page_raw)
+    try:
+        page = int(page_raw)
+    except ValueError:
+        await cb.answer('Некорректная страница')
+        return
     
     if not query:
         await cb.answer('Ошибка: не найден запрос')
