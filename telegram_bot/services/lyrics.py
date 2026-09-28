@@ -32,42 +32,28 @@ class LyricsService:
 
     async def _fetch_by_format(self, client, track_id: str, lyrics_format: str) -> str | None:
         """Запрашивает текст через актуальный API /tracks/{id}/lyrics."""
-        lyrics_meta = await client.tracks_lyrics(track_id, format_=lyrics_format)
-        if not lyrics_meta:
+        try:
+            lyrics_meta = await client.tracks_lyrics(track_id, format_=lyrics_format)
+            if not lyrics_meta:
+                return None
+
+            raw = await lyrics_meta.fetch_lyrics_async()
+            if not raw or not raw.strip():
+                return None
+
+            text = _lrc_to_text(raw) if lyrics_format == 'LRC' else raw
+            text = _normalize_lyrics(text)
+            return text or None
+        except Exception:
             return None
 
-        raw = await lyrics_meta.fetch_lyrics_async()
-        if not raw or not raw.strip():
-            return None
-
-        text = _lrc_to_text(raw) if lyrics_format == 'LRC' else raw
-        text = _normalize_lyrics(text)
-        return text or None
-
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
     async def get_lyrics(self, track_id: str, client) -> str | None:
         """Получает текст песни по track_id."""
-        try:
-            for lyrics_format in ('TEXT', 'LRC'):
-                try:
-                    text = await self._fetch_by_format(client, track_id, lyrics_format)
-                    if text:
-                        return text
-                except NotFoundError:
-                    logger.debug(
-                        f'Текст трека {track_id} не найден через API (format={lyrics_format})'
-                    )
-
-            return None
-        except UnauthorizedError:
-            logger.error(f'Нет авторизации для получения текста трека {track_id}')
-            return None
-        except NetworkError:
-            logger.error(f'Network error while getting lyrics for track {track_id}')
-            raise
-        except Exception:
-            logger.exception(f'Failed to get lyrics for track {track_id}')
-            return None
+        for lyrics_format in ('TEXT', 'LRC'):
+            text = await self._fetch_by_format(client, track_id, lyrics_format)
+            if text:
+                return text
+        return None
 
 
 def get_lyrics_service() -> LyricsService:

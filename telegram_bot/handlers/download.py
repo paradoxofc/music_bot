@@ -134,7 +134,6 @@ async def download_track(cb: types.CallbackQuery, yam_service: YAMService) -> No
 async def get_lyrics(cb: types.CallbackQuery, yam_service: YAMService) -> None:
     """Обработчик для получения текста песни."""
     logger.info(f'Пользователь {cb.from_user.id} запросил текст песни: {cb.data!r}')
-    await cb.answer('Ищу текст песни...')
 
     track_id = cb.data.split(':')[-1]
     if not is_valid_track_id(track_id):
@@ -142,14 +141,7 @@ async def get_lyrics(cb: types.CallbackQuery, yam_service: YAMService) -> None:
         return
 
     try:
-        # Получаем информацию о треке для отображения названия
-        track_info = await yam_service.get_track_info(track_id)
-        track_name = track_info[0]
-
-        # Получаем сервис для получения текстов
         lyrics_service = get_lyrics_service()
-
-        # Получаем текст песни
         lyrics = await lyrics_service.get_lyrics(track_id, yam_service.client)
         if lyrics:
             max_length = 4000
@@ -162,25 +154,19 @@ async def get_lyrics(cb: types.CallbackQuery, yam_service: YAMService) -> None:
             bot_link = html.escape(get_bot_link(), quote=True)
             safe_lyrics = html.escape(lyrics)
             response_text = f'{safe_lyrics}\n\n<a href="{bot_link}">Все текста — в одном боте</a>'
+            await cb.answer()
             await cb.message.answer(
                 text=response_text,
                 reply_markup=kb,
                 parse_mode=ParseMode.HTML,
             )
         else:
-            safe_name = html.escape(track_name)
-            await cb.message.answer(
-                text=f'😔 К сожалению, текст песни «{safe_name}» не найден.',
-                reply_markup=get_lyrics_not_found_kb(LYRICS_REQUEST_URL),
-            )
+            await cb.answer('😔 Текст для этой песни пока не добавлен.', show_alert=True)
     except Exception as e:
-        logger.exception(
-            f'Ошибка при получении текста песни {track_id} для пользователя {cb.from_user.id}'
+        logger.warning(
+            f'Не удалось получить текст песни {track_id} для {cb.from_user.id}: {e}'
         )
-        await cb.message.answer(
-            '❌ Не удалось получить текст песни. Попробуйте позже.',
-            reply_markup=get_error_kb(e, context=f'Текст песни ID: {track_id}'),
-        )
+        await cb.answer('😔 Текст для этой песни пока не добавлен.', show_alert=True)
 
 
 @router.callback_query(lambda cb: cb.data == 'delete_lyrics')
