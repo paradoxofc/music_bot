@@ -18,8 +18,12 @@ from ..db import (
 )
 
 MSK_TZ = timezone(timedelta(hours=3))
-REMINDER_TEXT = 'Музыка нас связала...Но ты не заходишь уже 3 дня, исправим?'
+REMINDER_TEXT = (
+    'Музыка нас связала... Но ты не заходишь, уже забыл про бота, '
+    'который бесплатно скачивает музыку, исправим?'
+)
 REMINDER_BUTTON_TEXT = 'Го исправлять!'
+TARGET_SEND_DURATION_SECONDS = 3600  # 1 час на распределение нагрузки
 
 _scheduler_task: asyncio.Task | None = None
 
@@ -48,20 +52,25 @@ def get_seconds_until_next_reminder(target_hour: int = 15, target_minute: int = 
 
 
 async def send_inactive_reminders(bot: Bot, days: int = 3) -> tuple[int, int]:
-    """Отправляет напоминание пользователям, не заходившим в бота 3+ дня."""
+    """Отправляет напоминание пользователям, не заходившим в бота 3+ дня, плавно в течение 1 часа."""
     inactive_user_ids = await get_inactive_user_ids(days=days)
     if not inactive_user_ids:
         logger.info('Напоминалка: нет неактивных пользователей (3+ дня)')
         return 0, 0
 
     total = len(inactive_user_ids)
-    logger.info(f'Напоминалка: найдено {total} неактивных пользователей для отправки')
+    # Распределяем отправку равномерно на 1 час (3600 секунд)
+    delay = max(0.05, min(5.0, TARGET_SEND_DURATION_SECONDS / total))
+    estimated_minutes = round((total * delay) / 60, 1)
+    logger.info(
+        f'Напоминалка: найдено {total} неактивных пользователей. '
+        f'Рассылка распределена на ~{estimated_minutes} мин. (пауза {delay:.2f} сек. между сообщениями)'
+    )
 
     sent = 0
     failed = 0
     blocked: list[int] = []
     reminded: list[int] = []
-    delay = 1 / max(1, BROADCAST_RATE)
     markup = get_reminder_kb()
 
     for chat_id in inactive_user_ids:
