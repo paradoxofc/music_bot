@@ -13,6 +13,8 @@ from ..keyboards import get_main_kb, get_favorites_kb, get_top_chart_kb
 from ..middlewares import YAMServiceMiddleware
 from ..services import YAMService
 from ..texts import MAIN_TEXT, NONE_FAVORITES_TEXT, FAVORITES_TEXT, TOP_CHAT_TEXT
+from .album import send_album_card
+
 
 router = Router()
 router.message.middleware(YAMServiceMiddleware())
@@ -49,24 +51,39 @@ async def _safe_update_message(
 
 
 @router.message(CommandStart())
-async def command_start(msg: types.Message, state: FSMContext, command: CommandObject) -> None:
+async def command_start(
+    msg: types.Message,
+    state: FSMContext,
+    command: CommandObject,
+    yam_service: YAMService,
+) -> None:
     """Обработчик команды /start."""
     logger.info(f'/start от {msg.from_user.id} ({msg.from_user.full_name})')
     await state.clear()
     await ensure_user(user_data=msg.from_user, source=command.args)
-    try:
-        await msg.answer_animation(
-            animation=START_GIF_URL,
-            caption=MAIN_TEXT,
-            reply_markup=get_main_kb(),
-            disable_notification=True
-        )
-    except TelegramBadRequest:
-        await msg.answer(
-            text=MAIN_TEXT,
-            reply_markup=get_main_kb(),
-            disable_notification=True
-        )
+
+    if command.args and command.args.startswith('album_'):
+        album_id = command.args.replace('album_', '', 1)
+        await send_album_card(msg, album_id, yam_service)
+        return
+
+    if START_GIF_URL:
+        try:
+            await msg.answer_animation(
+                animation=START_GIF_URL,
+                caption=MAIN_TEXT,
+                reply_markup=get_main_kb(),
+                disable_notification=True
+            )
+            return
+        except Exception as exc:
+            logger.warning(f"Ошибка при отправке анимации START_GIF_URL: {exc}")
+
+    await msg.answer(
+        text=MAIN_TEXT,
+        reply_markup=get_main_kb(),
+        disable_notification=True
+    )
 
 
 @router.callback_query(lambda c: c.data == 'main:menu')
@@ -152,3 +169,28 @@ async def favorites_button_message(msg: types.Message) -> None:
 async def handle_another(msg: types.Message) -> None:
     logger.debug(f'Удаляем сообщение {msg.message_id} от {msg.from_user.id} (voice/sticker)')
     await msg.delete()
+
+
+@router.callback_query(F.data == 'reminder:fix')
+async def reminder_fix_button(cb: types.CallbackQuery, state: FSMContext) -> None:
+    """Обработчик нажатия кнопки 'Го исправлять!' из напоминания."""
+    await state.clear()
+    await cb.answer('Погнали! 🎵')
+    with suppress(TelegramBadRequest):
+        await cb.message.delete()
+    if START_GIF_URL:
+        try:
+            await cb.message.answer_animation(
+                animation=START_GIF_URL,
+                caption=MAIN_TEXT,
+                reply_markup=get_main_kb(),
+            )
+            return
+        except Exception as exc:
+            logger.warning(f"Ошибка при отправке анимации в reminder_fix_button: {exc}")
+
+    await cb.message.answer(
+        text=MAIN_TEXT,
+        reply_markup=get_main_kb(),
+    )
+
