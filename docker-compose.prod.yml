@@ -1,14 +1,11 @@
 name: music-bot-main
 
-networks:
-  app:
-    driver: bridge
-
 services:
   bot:
     build: .
     command: /app/wait-for-db.sh make run.bot
     restart: unless-stopped
+    network_mode: host
     env_file:
       - .env
     depends_on:
@@ -16,8 +13,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    networks:
-      - app
     logging:
       driver: json-file
       options:
@@ -27,14 +22,13 @@ services:
   db:
     image: postgres:16
     restart: always
+    network_mode: host
     volumes:
       - pgdata:/var/lib/postgresql/data
     env_file:
       - .env
-    networks:
-      - app
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -48,10 +42,9 @@ services:
   redis:
     image: redis:8.0-alpine
     restart: unless-stopped
-    networks:
-      - app
+    network_mode: host
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: [ "CMD", "redis-cli", "-h", "127.0.0.1", "-p", "6379", "ping" ]
       interval: 10s
       timeout: 3s
       retries: 3
