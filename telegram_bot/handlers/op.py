@@ -3,9 +3,13 @@ from aiogram.exceptions import TelegramBadRequest
 from loguru import logger
 
 from ..config import DEBUG
-from ..db import ensure_user, get_active_op_setup
-from ..keyboards import get_main_kb
+from ..db import ensure_user
+from ..keyboards.main import get_main_kb
 from ..keyboards.op import get_op_subscribe_kb
+from ..middlewares.mandatory_subscription import (
+    get_cached_active_op_setup,
+    mark_user_passed,
+)
 from ..services.op_check import check_user_op_subscription
 from ..texts.main import MAIN_TEXT
 
@@ -37,7 +41,7 @@ async def _show_op_prompt(cb: types.CallbackQuery, setup: dict) -> None:
 
 @router.callback_query(lambda c: c.data == 'op:check')
 async def op_check_subscription(cb: types.CallbackQuery) -> None:
-    setup = await get_active_op_setup()
+    setup = await get_cached_active_op_setup()
     if DEBUG:
         logger.debug(
             'op:check user_id={} setup={} channels={}',
@@ -75,6 +79,7 @@ async def op_check_subscription(cb: types.CallbackQuery) -> None:
         await _show_op_prompt(cb, setup)
         return
 
+    await mark_user_passed(setup.get('id'), cb.from_user.id)
     await ensure_user(cb.from_user, source='op')
     await cb.answer('Подписка подтверждена!', show_alert=True)
     try:

@@ -1,3 +1,4 @@
+import asyncio
 import html
 
 from aiogram import Router, types
@@ -10,13 +11,32 @@ from ..constants import EventType, MAX_TG_UPLOAD
 from ..config import LYRICS_REQUEST_URL
 from ..keyboards import get_download_kb, get_lyrics_not_found_kb
 from ..middlewares import YAMServiceMiddleware
-from ..services import YAMService, get_lyrics_service
+from ..services import YAMService, get_lyrics_service, TrackNotFoundError, TrackTooLargeError
 from ..texts import get_bot_link, get_music_caption
-from ..utils import show_advert
+from ..utils import get_error_kb, show_advert
 from ..validators import is_valid_track_id
 
 router = Router()
 router.callback_query.middleware(YAMServiceMiddleware())
+
+
+async def _keep_upload_action(bot, chat_id: int, stop_event: asyncio.Event) -> None:
+    """Повторяет индикатор upload_document каждые 4 сек, пока загрузка не завершилась.
+
+    Без этого индикатор Telegram пропадает через ~5 сек, а загрузка трека может длиться 15–30 сек.
+    """
+    while not stop_event.is_set():
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action='upload_document')
+        except Exception:
+            pass
+        # Ждём 4 сек или выходим по stop_event
+        with asyncio.timeout(4):
+            try:
+                await asyncio.shield(stop_event.wait())
+            except (asyncio.TimeoutError, Exception):
+                pass
+
 
 
 @router.callback_query(lambda cb: cb.data.startswith('download'))
@@ -30,13 +50,18 @@ async def download_track(cb: types.CallbackQuery, yam_service: YAMService) -> No
 
     track_id = parts[-2]
     artist_id = parts[-1]
-    if not is_valid_track_id(track_id):
+    if not is_valid_track_id(track_id) or not is_valid_track_id(artist_id):
         await cb.answer('Некорректный трек', show_alert=True)
         return
 
     await send_event(event_type=EventType.DOWNLOAD, chat_id=cb.from_user.id)
     await cb.answer('Скачиваю трек...')
-    await cb.bot.send_chat_action(chat_id=cb.from_user.id, action='upload_document')
+
+    # Запускаем keep-alive задачу: индикатор загрузки будет повторяться пока не скачается трек.
+    stop_event = asyncio.Event()
+    action_task = asyncio.create_task(
+        _keep_upload_action(cb.bot, cb.from_user.id, stop_event)
+    )
 
     try:
         is_favorite = await check_favorite(cb.from_user.id, track_id)
@@ -54,14 +79,18 @@ async def download_track(cb: types.CallbackQuery, yam_service: YAMService) -> No
             except TelegramBadRequest as e:
                 logger.info(f'file_id недействителен у трека {track_id}: {e}')
 
-        artist, title, audio, cover = await yam_service.download_track(track_id)
+        artist, title, audio, cover, duration = await yam_service.download_track(track_id)
         if len(audio.data) > MAX_TG_UPLOAD:
-            await cb.message.answer('Файл трека слишком большой для отправки.')
+            await cb.message.answer(
+                '❌ Файл трека слишком большой для отправки.',
+                reply_markup=get_error_kb('Файл трека превышает лимит Telegram (50 МБ)', context=f'Трек {track_id}'),
+            )
             return
         msg = await cb.message.answer_audio(
             audio=audio,
             performer=artist,
             title=title,
+            duration=duration or None,
             thumbnail=cover,
             reply_markup=get_download_kb(track_id, artist_id, is_favorite),
             caption=get_music_caption(),
@@ -75,11 +104,30 @@ async def download_track(cb: types.CallbackQuery, yam_service: YAMService) -> No
             track_title=title,
         )
         await show_advert(cb.from_user.id)
-    except Exception:
+    except TrackNotFoundError as e:
+        logger.info(f'Трек {track_id} недоступен для пользователя {cb.from_user.id}')
+        await cb.message.answer(
+            '❌ Трек недоступен или был удалён.',
+            reply_markup=get_error_kb(e, context=f'Трек ID: {track_id}'),
+        )
+    except TrackTooLargeError as e:
+        logger.info(f'Трек {track_id} слишком большой для пользователя {cb.from_user.id}')
+        await cb.message.answer(
+            '❌ Файл слишком большой для отправки через Telegram (>50 МБ).',
+            reply_markup=get_error_kb(e, context=f'Трек ID: {track_id}'),
+        )
+    except Exception as e:
         logger.exception(
             f'Ошибка при скачивании трека {track_id} для пользователя {cb.from_user.id}'
         )
-        await cb.message.answer('Не удалось скачать трек. Попробуйте позже.')
+        await cb.message.answer(
+            '❌ Не удалось скачать трек. Попробуйте позже.',
+            reply_markup=get_error_kb(e, context=f'Скачивание трека ID: {track_id}'),
+        )
+    finally:
+        stop_event.set()
+        action_task.cancel()
+
 
 
 @router.callback_query(lambda cb: cb.data.startswith('get_lyrics'))
@@ -125,11 +173,14 @@ async def get_lyrics(cb: types.CallbackQuery, yam_service: YAMService) -> None:
                 text=f'😔 К сожалению, текст песни «{safe_name}» не найден.',
                 reply_markup=get_lyrics_not_found_kb(LYRICS_REQUEST_URL),
             )
-    except Exception:
+    except Exception as e:
         logger.exception(
             f'Ошибка при получении текста песни {track_id} для пользователя {cb.from_user.id}'
         )
-        await cb.message.answer('Не удалось получить текст песни. Попробуйте позже.')
+        await cb.message.answer(
+            '❌ Не удалось получить текст песни. Попробуйте позже.',
+            reply_markup=get_error_kb(e, context=f'Текст песни ID: {track_id}'),
+        )
 
 
 @router.callback_query(lambda cb: cb.data == 'delete_lyrics')

@@ -1,5 +1,3 @@
-import logging
-
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 back_to_admin_button = InlineKeyboardButton(text='Назад', callback_data='admin')

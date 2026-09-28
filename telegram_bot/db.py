@@ -1,7 +1,10 @@
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, List, Optional
+
 import asyncpg
-from loguru import logger
-from typing import Optional, List, Dict, Any
 from aiogram.types import User
+from loguru import logger
 import os
 
 from .constants import EventType
@@ -13,20 +16,27 @@ POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', '')
 POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'db')
 POSTGRES_PORT = os.getenv('POSTGRES_PORT', '5432')
 
-_db_pool = None
+_db_pool: asyncpg.Pool | None = None
+_pool_lock = asyncio.Lock()
+
 
 async def init_db_pool():
-    """Создаёт пул соединений с PostgreSQL"""
+    """Создаёт пул соединений с PostgreSQL (идемпотентно и без гонок)."""
     global _db_pool
-    if _db_pool is None:
+    if _db_pool is not None:
+        return _db_pool
+    async with _pool_lock:
+        if _db_pool is not None:
+            return _db_pool
         _db_pool = await asyncpg.create_pool(
             database=POSTGRES_DB,
             user=POSTGRES_USER,
             password=POSTGRES_PASSWORD,
             host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
+            port=int(POSTGRES_PORT),
             min_size=1,
-            max_size=10
+            max_size=10,
+            command_timeout=60,
         )
         async with _db_pool.acquire() as conn:
             await conn.execute(
@@ -133,10 +143,28 @@ async def init_db_pool():
         logger.info("Пул соединений с PostgreSQL создан")
     return _db_pool
 
+@asynccontextmanager
+async def acquire() -> AsyncIterator[asyncpg.Connection]:
+    """Безопасно берёт соединение из пула и всегда возвращает его обратно.
+
+    Использовать так:
+        async with acquire() as conn:
+            await conn.fetch(...)
+    """
+    pool = await init_db_pool()
+    async with pool.acquire() as conn:
+        yield conn
+
+
 async def get_db():
-    """Возвращает соединение из пула"""
+    """Возвращает соединение из пула.
+
+    Устаревший способ — предпочтительнее ``async with acquire() as conn``,
+    потому что он не теряет соединение при отмене задачи.
+    """
     pool = await init_db_pool()
     return await pool.acquire()
+
 
 async def release_db(conn):
     """Возвращает соединение обратно в пул"""
@@ -144,11 +172,22 @@ async def release_db(conn):
     await pool.release(conn)
 
 
+async def close_db_pool() -> None:
+    """Закрывает пул при остановке бота."""
+    global _db_pool
+    if _db_pool is not None:
+        await _db_pool.close()
+        _db_pool = None
+        logger.info('Пул соединений с PostgreSQL закрыт')
+
+
 async def _migrate_users_table(conn) -> None:
     """Миграции таблицы users."""
     migrations = (
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN',
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS downloads_count INTEGER NOT NULL DEFAULT 0',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW()',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reminded_at TIMESTAMPTZ',
         'ALTER TABLE users DROP COLUMN IF EXISTS gender',
         'ALTER TABLE users DROP COLUMN IF EXISTS age',
         'ALTER TABLE users DROP COLUMN IF EXISTS country',
@@ -156,6 +195,8 @@ async def _migrate_users_table(conn) -> None:
     )
     for query in migrations:
         await conn.execute(query)
+    await conn.execute('UPDATE users SET last_activity_at = created_at WHERE last_activity_at IS NULL')
+
 
 
 async def _migrate_schema(conn) -> None:
@@ -164,7 +205,10 @@ async def _migrate_schema(conn) -> None:
         'CREATE INDEX IF NOT EXISTS idx_events_type_created ON events (event_type, created_at)',
         'CREATE INDEX IF NOT EXISTS idx_events_chat_type ON events (chat_id, event_type)',
         'CREATE INDEX IF NOT EXISTS idx_users_active ON users (is_active) WHERE is_active = true',
+        'CREATE INDEX IF NOT EXISTS idx_users_activity ON users (last_activity_at) WHERE is_active = true',
         'CREATE INDEX IF NOT EXISTS idx_favorites_chat_created ON favorites (chat_id, created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_users_created ON users (created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_events_created ON events (created_at DESC)',
     )
     for query in index_queries:
         await conn.execute(query)
@@ -198,25 +242,30 @@ async def _migrate_schema(conn) -> None:
 # ========== ПОЛЬЗОВАТЕЛИ ==========
 
 async def create_user(user_data: User, source: str | None) -> Optional[Dict]:
-    """Создаёт или обновляет пользователя в БД."""
-    conn = await get_db()
-    try:
+    """Создаёт или обновляет пользователя в БД.
+
+    В результат добавляется служебный ключ ``is_new``: True, если строка была
+    именно вставлена (``xmax = 0``), а не обновлена. Это позволяет определить
+    первую регистрацию одним запросом, без гонки «прочитали — записали».
+    """
+    async with acquire() as conn:
         is_premium = bool(getattr(user_data, 'is_premium', None) or False)
         result = await conn.fetchrow(
             """
             INSERT INTO users (
                 chat_id, username, first_name, last_name, language, source,
-                is_active, is_premium, created_at
+                is_active, is_premium, created_at, last_activity_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, true, $7, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, true, $7, NOW(), NOW())
             ON CONFLICT (chat_id) DO UPDATE SET
                 username = EXCLUDED.username,
                 first_name = EXCLUDED.first_name,
                 last_name = EXCLUDED.last_name,
                 language = EXCLUDED.language,
                 is_premium = EXCLUDED.is_premium,
-                is_active = true
-            RETURNING *
+                is_active = true,
+                last_activity_at = NOW()
+            RETURNING *, (xmax = 0) AS is_new
             """,
             user_data.id,
             user_data.username,
@@ -227,8 +276,6 @@ async def create_user(user_data: User, source: str | None) -> Optional[Dict]:
             is_premium,
         )
         return dict(result) if result else None
-    finally:
-        await release_db(conn)
 
 
 async def ensure_user(user_data: User, source: str | None = None) -> bool:
@@ -236,35 +283,28 @@ async def ensure_user(user_data: User, source: str | None = None) -> bool:
     Гарантирует наличие пользователя в БД.
     Возвращает True, если пользователь зарегистрирован впервые.
     """
-    is_new = await get_user(user_data.id) is None
-    await create_user(user_data, source)
+    created = await create_user(user_data, source)
+    is_new = bool(created and created.get('is_new'))
     if is_new:
         await send_event(event_type=EventType.REGISTRATION, chat_id=user_data.id)
     return is_new
 
 async def get_user(chat_id: int) -> Optional[Dict]:
     """Получает пользователя по chat_id"""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         result = await conn.fetchrow("SELECT * FROM users WHERE chat_id = $1", chat_id)
         return dict(result) if result else None
-    finally:
-        await release_db(conn)
 
 async def get_users_count() -> int:
     """Число пользователей без загрузки всех строк."""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         total = await conn.fetchval('SELECT COUNT(*)::int FROM users')
         return int(total or 0)
-    finally:
-        await release_db(conn)
 
 
 async def get_all_users_for_report() -> List[Dict]:
     """Все пользователи для Excel-отчёта."""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT
@@ -276,40 +316,128 @@ async def get_all_users_for_report() -> List[Dict]:
             """
         )
         return [dict(row) for row in rows]
-    finally:
-        await release_db(conn)
 
 
 async def get_downloads_total_count() -> int:
     """Общее число скачиваний (из денормализованного счётчика)."""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         total = await conn.fetchval(
             'SELECT COALESCE(SUM(downloads_count), 0)::int FROM users',
         )
         return int(total or 0)
-    finally:
-        await release_db(conn)
 
 
 async def set_blocked_status(chat_id: int, is_blocked: bool) -> Optional[Dict]:
     """Блокирует/разблокирует пользователя"""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         result = await conn.fetchrow(
             "UPDATE users SET is_active = $1 WHERE chat_id = $2 RETURNING *",
             not is_blocked, chat_id
         )
         return dict(result) if result else None
-    finally:
-        await release_db(conn)
+
+async def set_blocked_status_bulk(chat_ids: List[int]) -> None:
+    """Помечает пачку пользователей как заблокировавших бота (после рассылки)."""
+    if not chat_ids:
+        return
+    unique_ids = list(set(chat_ids))
+    async with acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET is_active = false WHERE chat_id = ANY($1::bigint[])",
+            unique_ids,
+        )
+
+
+async def update_user_activity(chat_id: int) -> None:
+    """Обновляет время последней активности пользователя."""
+    async with acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET last_activity_at = NOW(), is_active = true
+            WHERE chat_id = $1
+            """,
+            chat_id,
+        )
+
+
+async def get_inactive_user_ids(days: int = 3) -> list[int]:
+    """Возвращает chat_id активных пользователей, не заходивших >= days дней."""
+    async with acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT chat_id
+            FROM users
+            WHERE is_active = true
+              AND last_activity_at <= NOW() - ($1 * INTERVAL '1 day')
+              AND (last_reminded_at IS NULL OR last_reminded_at < last_activity_at)
+            ORDER BY chat_id
+            """,
+            int(days),
+        )
+        return [row['chat_id'] for row in rows]
+
+
+async def set_reminded_status_bulk(chat_ids: list[int]) -> None:
+    """Помечает пользователей как получивших напоминание."""
+    if not chat_ids:
+        return
+    unique_ids = list(set(chat_ids))
+    async with acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET last_reminded_at = NOW()
+            WHERE chat_id = ANY($1::bigint[])
+            """,
+            unique_ids,
+        )
+
+
+
+
+async def iter_active_user_ids(batch_size: int = 1000) -> AsyncIterator[int]:
+    """Курсор по активным пользователям — не тянет всю базу в память."""
+    async with acquire() as conn:
+        async with conn.transaction():
+            cursor = conn.cursor(
+                'SELECT chat_id FROM users WHERE is_active = true ORDER BY chat_id'
+            )
+            async for record in cursor:
+                yield record['chat_id']
+
+
+async def get_active_users_count() -> int:
+    """Число активных пользователей (для прогресса рассылки)."""
+    async with acquire() as conn:
+        total = await conn.fetchval('SELECT COUNT(*)::int FROM users WHERE is_active = true')
+        return int(total or 0)
+
+
+async def try_start_broadcast(broadcast_id: int | str) -> bool:
+    """Атомарно помечает рассылку запущенной.
+
+    Возвращает False, если она уже была запущена — защита от двойного клика
+    по «Запустить».
+    """
+    async with acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE broadcasts
+            SET is_sent = true, updated_at = NOW()
+            WHERE id = $1 AND is_sent = false
+            RETURNING id
+            """,
+            int(broadcast_id),
+        )
+        return row is not None
+
 
 # ========== ТРЕКИ (КЭШ) ==========
 
 async def save_track(track_id: str, file_id: str, artist_id: str, artist_name: str, track_title: str) -> Optional[Dict]:
     """Сохраняет трек в кэш"""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         result = await conn.fetchrow(
             """
             INSERT INTO tracks (track_id, file_id, artist_id, artist_name, track_title, created_at)
@@ -323,39 +451,36 @@ async def save_track(track_id: str, file_id: str, artist_id: str, artist_name: s
             track_id, file_id, artist_id, artist_name, track_title
         )
         return dict(result) if result else None
-    finally:
-        await release_db(conn)
+
+async def delete_track(track_id: str) -> None:
+    """Удаляет трек из кэша (например, если file_id протух)."""
+    async with acquire() as conn:
+        await conn.execute("DELETE FROM tracks WHERE track_id = $1", track_id)
+
 
 async def get_track(track_id: str) -> Optional[Dict]:
     """Получает трек из кэша"""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         result = await conn.fetchrow("SELECT * FROM tracks WHERE track_id = $1", track_id)
         return dict(result) if result else None
-    finally:
-        await release_db(conn)
 
 
 async def get_tracks_by_ids(track_ids: list[str]) -> list[Dict]:
     """Получает несколько треков из кэша одним запросом."""
     if not track_ids:
         return []
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         rows = await conn.fetch(
             "SELECT * FROM tracks WHERE track_id = ANY($1::text[])",
             track_ids,
         )
         return [dict(row) for row in rows]
-    finally:
-        await release_db(conn)
 
 # ========== ИЗБРАННОЕ ==========
 
 async def add_to_favorites(chat_id: int, track_id: str, title: str, artist_id: int | str) -> Optional[Dict]:
     """Добавляет трек в избранное"""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         normalized_artist_id = str(artist_id)
         result = await conn.fetchrow(
             """
@@ -367,25 +492,19 @@ async def add_to_favorites(chat_id: int, track_id: str, title: str, artist_id: i
             chat_id, track_id, title, normalized_artist_id
         )
         return dict(result) if result else None
-    finally:
-        await release_db(conn)
 
 async def delete_from_favorites(chat_id: int, track_id: str) -> Optional[Dict]:
     """Удаляет трек из избранного"""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         result = await conn.fetchrow(
             "DELETE FROM favorites WHERE chat_id = $1 AND track_id = $2 RETURNING *",
             chat_id, track_id
         )
         return dict(result) if result else None
-    finally:
-        await release_db(conn)
 
 async def get_favorites(chat_id: int, page: str | None = None, limit: int = 10) -> Dict[str, Any]:
     """Получает избранное пользователя с пагинацией."""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         page_num = int(page) if page and page.isdigit() else 1
         page_num = max(1, page_num)
         offset = (page_num - 1) * limit
@@ -412,27 +531,21 @@ async def get_favorites(chat_id: int, page: str | None = None, limit: int = 10) 
             'previous': [str(page_num - 1)] if has_prev else None,
             'next': [str(page_num + 1)] if has_next else None,
         }
-    finally:
-        await release_db(conn)
 
 async def check_favorite(chat_id: int, track_id: str) -> bool:
     """Проверяет, есть ли трек в избранном"""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         result = await conn.fetchval(
             "SELECT 1 FROM favorites WHERE chat_id = $1 AND track_id = $2 LIMIT 1",
             chat_id, track_id
         )
         return result is not None
-    finally:
-        await release_db(conn)
 
 # ========== СОБЫТИЯ ==========
 
 async def send_event(event_type: int | str, chat_id: int) -> Optional[Dict]:
     """Логирует событие пользователя"""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         normalized_event_type = str(event_type)
         async with conn.transaction():
             result = await conn.fetchrow(
@@ -454,14 +567,11 @@ async def send_event(event_type: int | str, chat_id: int) -> Optional[Dict]:
                     chat_id,
                 )
         return dict(result) if result else None
-    finally:
-        await release_db(conn)
 
 
 async def get_users_stats() -> Dict[str, int]:
     """Возвращает агрегированную статистику пользователей."""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT
@@ -474,8 +584,6 @@ async def get_users_stats() -> Dict[str, int]:
         if not row:
             return {'total': 0, 'active': 0, 'blocked': 0}
         return {'total': row['total'], 'active': row['active'], 'blocked': row['blocked']}
-    finally:
-        await release_db(conn)
 
 
 def _format_period_stats(row) -> Dict[str, Dict[str, int | str] | int]:
@@ -532,34 +640,27 @@ _PERIOD_STATS_SQL = """
 
 async def get_registration_stats() -> Dict[str, Dict[str, int | str] | int]:
     """Возвращает статистику регистраций по периодам."""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         query = _PERIOD_STATS_SQL.format(table='users', where_clause='')
         row = await conn.fetchrow(query)
         return _format_period_stats(row)
-    finally:
-        await release_db(conn)
 
 
 async def get_event_type_stats(event_type: int | str) -> Dict[str, Dict[str, int | str] | int]:
     """Возвращает статистику событий по типу и периодам."""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         query = _PERIOD_STATS_SQL.format(
             table='events',
             where_clause='WHERE event_type = $1',
         )
         row = await conn.fetchrow(query, str(event_type))
         return _format_period_stats(row)
-    finally:
-        await release_db(conn)
 
 
 # ========== РАССЫЛКИ ==========
 
 async def create_broadcast(name: str = 'Новая рассылка') -> Optional[Dict]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO broadcasts (name, message, file_type, file_id, is_sent, created_at, updated_at)
@@ -569,13 +670,10 @@ async def create_broadcast(name: str = 'Новая рассылка') -> Optiona
             name
         )
         return dict(row) if row else None
-    finally:
-        await release_db(conn)
 
 
 async def get_broadcast(broadcast_id: int | str) -> Optional[Dict]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM broadcasts WHERE id = $1", int(broadcast_id))
         if not row:
             return None
@@ -591,26 +689,20 @@ async def get_broadcast(broadcast_id: int | str) -> Optional[Dict]:
         )
         data['buttons'] = [dict(r) for r in buttons_rows]
         return data
-    finally:
-        await release_db(conn)
 
 
 async def get_sent_broadcasts_count() -> int:
     """Число рассылок, которые были запущены (is_sent = true)."""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         total = await conn.fetchval(
             'SELECT COUNT(*)::int FROM broadcasts WHERE is_sent = true',
         )
         return int(total or 0)
-    finally:
-        await release_db(conn)
 
 
 async def get_broadcasts_summary() -> Dict[str, int]:
     """Сводка по рассылкам: всего создано и сколько запущено."""
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT
@@ -622,13 +714,10 @@ async def get_broadcasts_summary() -> Dict[str, int]:
         if not row:
             return {'total': 0, 'sent': 0}
         return {'total': row['total'], 'sent': row['sent']}
-    finally:
-        await release_db(conn)
 
 
 async def list_broadcasts(page: int = 1, limit: int = 10) -> Dict[str, Any]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         safe_page = max(1, int(page))
         offset = (safe_page - 1) * limit
         rows = await conn.fetch(
@@ -649,13 +738,10 @@ async def list_broadcasts(page: int = 1, limit: int = 10) -> Dict[str, Any]:
             'next_page': safe_page + 1 if has_next else None,
             'page': safe_page,
         }
-    finally:
-        await release_db(conn)
 
 
 async def update_broadcast(broadcast_id: int | str, data: Dict[str, Any]) -> Optional[Dict]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         fields = []
         values = []
         idx = 1
@@ -673,32 +759,27 @@ async def update_broadcast(broadcast_id: int | str, data: Dict[str, Any]) -> Opt
         query = f"UPDATE broadcasts SET {', '.join(fields)} WHERE id = ${idx} RETURNING *"
         row = await conn.fetchrow(query, *values)
         return dict(row) if row else None
-    finally:
-        await release_db(conn)
 
 
 async def set_broadcast_buttons(broadcast_id: int | str, buttons: List[Dict[str, str]]) -> None:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         bid = int(broadcast_id)
-        await conn.execute("DELETE FROM broadcast_buttons WHERE broadcast_id = $1", bid)
-        for pos, button in enumerate(buttons):
-            await conn.execute(
-                """
-                INSERT INTO broadcast_buttons (broadcast_id, text, url, position)
-                VALUES ($1, $2, $3, $4)
-                """,
-                bid, button['text'], button['url'], pos
-            )
-    finally:
-        await release_db(conn)
+        async with conn.transaction():
+            await conn.execute("DELETE FROM broadcast_buttons WHERE broadcast_id = $1", bid)
+            if buttons:
+                await conn.executemany(
+                    """
+                    INSERT INTO broadcast_buttons (broadcast_id, text, url, position)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    [(bid, b['text'], b['url'], pos) for pos, b in enumerate(buttons)],
+                )
 
 
 # ========== ОБЯЗАТЕЛЬНАЯ ПОДПИСКА (ОП) ==========
 
 async def create_op_setup(name: str = 'Новая ОП') -> Optional[Dict]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO op_setups (name, message, is_active, created_at, updated_at)
@@ -708,13 +789,10 @@ async def create_op_setup(name: str = 'Новая ОП') -> Optional[Dict]:
             name,
         )
         return dict(row) if row else None
-    finally:
-        await release_db(conn)
 
 
 async def get_op_setup(op_setup_id: int | str) -> Optional[Dict]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM op_setups WHERE id = $1", int(op_setup_id))
         if not row:
             return None
@@ -730,13 +808,10 @@ async def get_op_setup(op_setup_id: int | str) -> Optional[Dict]:
         )
         data['channels'] = [dict(r) for r in channel_rows]
         return data
-    finally:
-        await release_db(conn)
 
 
 async def list_op_setups(page: int = 1, limit: int = 10) -> Dict[str, Any]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         safe_page = max(1, int(page))
         offset = (safe_page - 1) * limit
         rows = await conn.fetch(
@@ -758,13 +833,10 @@ async def list_op_setups(page: int = 1, limit: int = 10) -> Dict[str, Any]:
             'next_page': safe_page + 1 if has_next else None,
             'page': safe_page,
         }
-    finally:
-        await release_db(conn)
 
 
 async def update_op_setup(op_setup_id: int | str, data: Dict[str, Any]) -> Optional[Dict]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         fields = []
         values = []
         idx = 1
@@ -782,47 +854,48 @@ async def update_op_setup(op_setup_id: int | str, data: Dict[str, Any]) -> Optio
         query = f"UPDATE op_setups SET {', '.join(fields)} WHERE id = ${idx} RETURNING *"
         row = await conn.fetchrow(query, *values)
         return dict(row) if row else None
-    finally:
-        await release_db(conn)
 
 
 async def set_op_channels(op_setup_id: int | str, channels: List[Dict[str, str]]) -> None:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         oid = int(op_setup_id)
-        await conn.execute("DELETE FROM op_channels WHERE op_setup_id = $1", oid)
-        for pos, channel in enumerate(channels):
-            await conn.execute(
-                """
-                INSERT INTO op_channels (op_setup_id, button_text, channel_ref, invite_url, position)
-                VALUES ($1, $2, $3, $4, $5)
-                """,
-                oid,
-                channel['button_text'],
-                channel['channel_ref'],
-                channel.get('invite_url'),
-                pos,
-            )
-    finally:
-        await release_db(conn)
+        async with conn.transaction():
+            await conn.execute("DELETE FROM op_channels WHERE op_setup_id = $1", oid)
+            if channels:
+                await conn.executemany(
+                    """
+                    INSERT INTO op_channels (op_setup_id, button_text, channel_ref, invite_url, position)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    [
+                        (
+                            oid,
+                            channel['button_text'],
+                            channel['channel_ref'],
+                            channel.get('invite_url'),
+                            pos,
+                        )
+                        for pos, channel in enumerate(channels)
+                    ],
+                )
 
 
 async def activate_op_setup(op_setup_id: int | str) -> Optional[Dict]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         oid = int(op_setup_id)
-        await conn.execute("UPDATE op_setups SET is_active = false, updated_at = NOW()")
-        row = await conn.fetchrow(
-            """
-            UPDATE op_setups SET is_active = true, updated_at = NOW()
-            WHERE id = $1
-            RETURNING *
-            """,
-            oid,
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE op_setups SET is_active = false, updated_at = NOW() WHERE is_active = true"
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE op_setups SET is_active = true, updated_at = NOW()
+                WHERE id = $1
+                RETURNING *
+                """,
+                oid,
+            )
         return dict(row) if row else None
-    finally:
-        await release_db(conn)
 
 
 async def deactivate_op_setup(op_setup_id: int | str) -> Optional[Dict]:
@@ -830,8 +903,7 @@ async def deactivate_op_setup(op_setup_id: int | str) -> Optional[Dict]:
 
 
 async def get_active_op_setup() -> Optional[Dict]:
-    conn = await get_db()
-    try:
+    async with acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT * FROM op_setups
@@ -854,5 +926,3 @@ async def get_active_op_setup() -> Optional[Dict]:
         )
         data['channels'] = [dict(r) for r in channel_rows]
         return data
-    finally:
-        await release_db(conn)

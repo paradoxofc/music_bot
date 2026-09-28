@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+# Секреты не должны попадать в образ — они прокидываются через env_file
+.env
+.env.*
+!.env.example
+tests
+*.md

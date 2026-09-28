@@ -1,23 +1,32 @@
 import asyncio
+import contextlib
 from typing import Any
 
 from aiogram import F, types
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from loguru import logger
 
 from .main import router
+from ...config import BROADCAST_RATE
 from ...constants import EventType
 from ...db import (
     create_broadcast,
+    get_active_users_count,
     get_broadcast,
     get_broadcasts_summary,
+    iter_active_user_ids,
     list_broadcasts,
     send_event,
+    set_blocked_status_bulk,
     set_broadcast_buttons,
+    try_start_broadcast,
     update_broadcast,
-    get_db,
-    release_db,
 )
 from ...keyboards import back_to_admin_button, get_admin_main_kb, get_broadcast_retrieve_kb, get_broadcasts_kb
 from ...validators import is_safe_http_url
@@ -40,6 +49,8 @@ class EditBroadcast(StatesGroup):
     waiting_text = State()
     waiting_media = State()
     waiting_buttons = State()
+    waiting_limit = State()
+
 
 
 def _build_url_buttons(buttons: list[dict]) -> types.InlineKeyboardMarkup | None:
@@ -92,7 +103,9 @@ async def add_broadcast(cb: types.CallbackQuery) -> None:
 
 
 @router.callback_query(lambda c: c.data.startswith('broadcast:retrieve'))
-async def retrieve(cb: types.CallbackQuery) -> None:
+async def retrieve(cb: types.CallbackQuery, state: FSMContext | None = None) -> None:
+    if state:
+        await state.clear()
     await cb.answer()
     broadcast_id = cb.data.split(':')[-1]
     broadcast_data = await get_broadcast(broadcast_id)
@@ -106,6 +119,7 @@ async def retrieve(cb: types.CallbackQuery) -> None:
         text=get_broadcast_retrieve_text(broadcast_data),
         reply_markup=get_broadcast_retrieve_kb(broadcast_id)
     )
+
 
 
 @router.callback_query(lambda c: c.data.startswith('broadcast:edit_name'))
@@ -238,7 +252,8 @@ async def edit_broadcast_buttons_receive(msg: types.Message, state: FSMContext) 
 
 
 @router.callback_query(lambda c: c.data.startswith('broadcast:send'))
-async def send_broadcast(cb: types.CallbackQuery) -> None:
+async def send_broadcast(cb: types.CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     _, _, target, broadcast_id = cb.data.split(':', 3)
     broadcast = await get_broadcast(broadcast_id)
     if not broadcast:
@@ -250,15 +265,40 @@ async def send_broadcast(cb: types.CallbackQuery) -> None:
         return
 
     if target == 'all':
-        await cb.message.edit_text(
-            text='<b>❓ Вы уверены, что хотите запустить рассылку?</b>',
-            reply_markup=types.InlineKeyboardMarkup(
-                inline_keyboard=[[
-                    types.InlineKeyboardButton(text='Да', callback_data=f'broadcast:action:confirm:{broadcast_id}'),
-                    types.InlineKeyboardButton(text='Нет', callback_data=f'broadcast:retrieve:{broadcast_id}')
-                ]]
-            )
+        active_count = await get_active_users_count()
+        if active_count == 0:
+            await cb.answer('В базе нет активных пользователей для рассылки', show_alert=True)
+            return
+
+        text = (
+            f'🚀 <b>Запуск рассылки #{broadcast_id}</b>\n\n'
+            f'Доступно активных пользователей: <b>{active_count}</b>\n'
+            f'<i>(пользователи, заблокировавшие бота, исключены автоматически)</i>\n\n'
+            f'Выберите режим отправки:'
         )
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text=f'👥 Всем активным ({active_count})',
+                        callback_data=f'broadcast:confirm:all:{broadcast_id}'
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text='🎯 Указать количество юзеров',
+                        callback_data=f'broadcast:ask_limit:{broadcast_id}'
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text='◀️ Назад',
+                        callback_data=f'broadcast:retrieve:{broadcast_id}'
+                    )
+                ]
+            ]
+        )
+        await cb.message.edit_text(text=text, reply_markup=kb)
         await cb.answer()
         return
 
@@ -266,39 +306,243 @@ async def send_broadcast(cb: types.CallbackQuery) -> None:
     await cb.answer(text='Отправлено вам', show_alert=True)
 
 
-@router.callback_query(lambda c: c.data.startswith('broadcast:action:confirm'))
-async def send_to_all_confirm(cb: types.CallbackQuery) -> None:
+@router.callback_query(lambda c: c.data.startswith('broadcast:confirm:all'))
+async def broadcast_confirm_all(cb: types.CallbackQuery) -> None:
     broadcast_id = cb.data.split(':')[-1]
+    active_count = await get_active_users_count()
+    text = (
+        f'<b>❓ Подтверждение запуска рассылки</b>\n\n'
+        f'Рассылка: <b>#{broadcast_id}</b>\n'
+        f'Получатели: <b>все активные пользователи ({active_count})</b>\n'
+        f'<i>(заблокировавшие бота пользователи не получат сообщение)</i>\n\n'
+        f'Запустить рассылку?'
+    )
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text='✅ Да, запустить',
+                    callback_data=f'broadcast:run:all:{broadcast_id}'
+                ),
+                types.InlineKeyboardButton(
+                    text='❌ Отмена',
+                    callback_data=f'broadcast:retrieve:{broadcast_id}'
+                )
+            ]
+        ]
+    )
+    await cb.message.edit_text(text=text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data.startswith('broadcast:ask_limit'))
+async def broadcast_ask_limit(cb: types.CallbackQuery, state: FSMContext) -> None:
+    broadcast_id = cb.data.split(':')[-1]
+    active_count = await get_active_users_count()
+    await state.set_state(EditBroadcast.waiting_limit)
+    await state.update_data(broadcast_id=broadcast_id, active_count=active_count)
+    await cb.answer()
+
+    text = (
+        f'🎯 <b>Укажите количество пользователей</b>\n\n'
+        f'Доступно активных пользователей: <b>{active_count}</b>\n'
+        f'<i>(пользователи, заблокировавшие бота, исключены)</i>\n\n'
+        f'Отправьте желаемое число сообщением (например, <code>100</code> или <code>500</code>):'
+    )
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text='◀️ Отмена',
+                    callback_data=f'broadcast:retrieve:{broadcast_id}'
+                )
+            ]
+        ]
+    )
+    await cb.message.edit_text(text=text, reply_markup=kb)
+
+
+@router.message(EditBroadcast.waiting_limit, F.text)
+async def broadcast_limit_receive(msg: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    broadcast_id = data.get('broadcast_id')
+    raw_text = (msg.text or '').strip()
+
+    if not raw_text.isdigit() or int(raw_text) <= 0:
+        await msg.answer(
+            '⚠️ Пожалуйста, введите положительное целое число (например, <code>100</code>):',
+            reply_markup=types.InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        types.InlineKeyboardButton(
+                            text='◀️ Отмена',
+                            callback_data=f'broadcast:retrieve:{broadcast_id}'
+                        )
+                    ]
+                ]
+            )
+        )
+        return
+
+    limit = int(raw_text)
+    active_count = await get_active_users_count()
+    warning_text = ''
+    if limit > active_count:
+        warning_text = (
+            f'ℹ️ В базе только <b>{active_count}</b> активных пользователей.\n'
+            f'Количество скорректировано до <b>{active_count}</b>.\n\n'
+        )
+        limit = active_count
+
+    await state.clear()
+
+    text = (
+        f'{warning_text}'
+        f'<b>❓ Подтверждение запуска рассылки</b>\n\n'
+        f'Рассылка: <b>#{broadcast_id}</b>\n'
+        f'Количество получателей: <b>{limit}</b> активных пользователей\n'
+        f'<i>(только пользователи, не заблокировавшие бота)</i>\n\n'
+        f'Запустить рассылку?'
+    )
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text='✅ Да, запустить',
+                    callback_data=f'broadcast:run:{limit}:{broadcast_id}'
+                ),
+                types.InlineKeyboardButton(
+                    text='❌ Отмена',
+                    callback_data=f'broadcast:retrieve:{broadcast_id}'
+                )
+            ]
+        ]
+    )
+    await msg.answer(text=text, reply_markup=kb)
+
+
+async def _run_broadcast(
+    bot: Any,
+    admin_chat_id: int,
+    broadcast: dict,
+    limit: int | None = None,
+) -> None:
+    """Фоновая отправка рассылки активным пользователям."""
+    broadcast_id = broadcast['id']
+    sent = 0
+    failed = 0
+    blocked: list[int] = []
+    total_active = await get_active_users_count()
+    target_count = min(total_active, limit) if limit else total_active
+    delay = 1 / max(1, BROADCAST_RATE)
+
+    limit_desc = f'{target_count} пользователей' if limit else f'всем ({total_active})'
+    status_message = await bot.send_message(
+        chat_id=admin_chat_id,
+        text=f'🚀 Рассылка #{broadcast_id} запущена. Цель: {limit_desc}.',
+    )
+
+    async for chat_id in iter_active_user_ids():
+        if limit is not None and sent >= limit:
+            break
+
+        try:
+            await _send_broadcast_message(bot, chat_id, broadcast)
+            sent += 1
+        except TelegramRetryAfter as e:
+            logger.warning(f'Рассылка {broadcast_id}: flood control, пауза {e.retry_after}s')
+            await asyncio.sleep(e.retry_after)
+            try:
+                await _send_broadcast_message(bot, chat_id, broadcast)
+                sent += 1
+            except (TelegramForbiddenError, TelegramBadRequest) as retry_err:
+                failed += 1
+                err_msg = str(retry_err).lower()
+                if isinstance(retry_err, TelegramForbiddenError) or any(
+                    s in err_msg for s in ('chat not found', 'user not found', 'deactivated', 'bot was blocked', "can't initiate")
+                ):
+                    blocked.append(chat_id)
+            except Exception as retry_error:
+                failed += 1
+                logger.warning(
+                    f'Рассылка {broadcast_id}: повтор для {chat_id} не удался: {retry_error}'
+                )
+        except TelegramForbiddenError:
+            # Пользователь заблокировал бота — помечаем неактивным
+            failed += 1
+            blocked.append(chat_id)
+        except TelegramBadRequest as e:
+            failed += 1
+            err_msg = str(e).lower()
+            if any(
+                s in err_msg
+                for s in ('chat not found', 'user not found', 'deactivated', 'bot was blocked', "can't initiate conversation")
+            ):
+                blocked.append(chat_id)
+            else:
+                logger.warning(f'Рассылка {broadcast_id}: ошибка для {chat_id}: {e}')
+        except Exception as e:
+            failed += 1
+            logger.warning(f'Рассылка {broadcast_id}: ошибка для {chat_id}: {e}')
+
+        # Сохраняем заблокированных пользователей пачками по 20
+        if len(blocked) >= 20:
+            await set_blocked_status_bulk(blocked)
+            blocked.clear()
+
+        # Обновляем статус каждые 50 отправок или при завершении
+        if (sent + failed) % 50 == 0 or (limit and sent >= limit):
+            with contextlib.suppress(Exception):
+                await status_message.edit_text(
+                    f'🚀 Рассылка #{broadcast_id} в процессе...\n\n'
+                    f'🎯 Цель: <b>{target_count}</b>\n'
+                    f'✅ Доставлено: <b>{sent}/{target_count}</b>\n'
+                    f'🚫 Не доставлено (блок бота): <b>{failed}</b>'
+                )
+
+        await asyncio.sleep(delay)
+
+    if blocked:
+        await set_blocked_status_bulk(blocked)
+
+    if sent > 0:
+        await send_event(event_type=EventType.BROADCAST, chat_id=admin_chat_id)
+
+    logger.info(f'Рассылка {broadcast_id} завершена: отправлено {sent}, ошибок/блокировок {failed}')
+    with contextlib.suppress(Exception):
+        await status_message.edit_text(
+            f'✅ <b>Рассылка #{broadcast_id} завершена!</b>\n\n'
+            f'📨 Доставлено активным пользователям: <b>{sent}</b>'
+            + (f' из {target_count}' if limit else '')
+            + f'\n🚫 Заблокировали бота / не доставлено: <b>{failed}</b>'
+        )
+
+
+@router.callback_query(lambda c: c.data.startswith(('broadcast:run:', 'broadcast:action:confirm:')))
+async def run_broadcast_callback(cb: types.CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    parts = cb.data.split(':')
+    if cb.data.startswith('broadcast:run:'):
+        limit_str = parts[2]
+        broadcast_id = parts[3]
+    else:
+        limit_str = 'all'
+        broadcast_id = parts[-1]
+
     broadcast = await get_broadcast(broadcast_id)
     if not broadcast:
         await cb.answer('Рассылка не найдена', show_alert=True)
         return
-    if broadcast.get('is_sent'):
+
+    # Атомарно помечаем рассылку запущенной — защита от параллельного запуска
+    if not await try_start_broadcast(broadcast_id):
         await cb.answer('Рассылка уже была отправлена', show_alert=True)
         return
 
-    sent = 0
-    failed = 0
-    conn = await get_db()
-    try:
-        users = await conn.fetch("SELECT chat_id FROM users WHERE is_active = true")
-    finally:
-        await release_db(conn)
+    limit = None if limit_str == 'all' else int(limit_str)
+    await cb.answer('Рассылка запущена', show_alert=True)
+    asyncio.create_task(_run_broadcast(cb.bot, cb.from_user.id, broadcast, limit=limit))
 
-    for row in users:
-        chat_id = row['chat_id']
-        try:
-            await _send_broadcast_message(cb.bot, chat_id, broadcast)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            failed += 1
-            logger.warning(f'Не удалось отправить рассылку {broadcast_id} пользователю {chat_id}: {e}')
-
-    await update_broadcast(broadcast_id, {'is_sent': True})
-    if sent > 0:
-        await send_event(event_type=EventType.BROADCAST, chat_id=cb.from_user.id)
-    await cb.answer(text=f'Готово: отправлено {sent}, ошибок {failed}', show_alert=True)
     await cb.message.edit_text(
         text=ADMIN_MAIN_TEXT.format(name=cb.from_user.full_name),
         reply_markup=get_admin_main_kb()

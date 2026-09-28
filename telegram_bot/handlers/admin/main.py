@@ -1,39 +1,62 @@
+from contextlib import suppress
 from aiogram import Router, F, types
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 
-from ...config import admin_user_id
+from ...config import is_admin
 from ...keyboards import get_admin_main_kb
-from ...middlewares import IsAdminMiddleware
 from ...texts import ADMIN_MAIN_TEXT
 
 router = Router()
-router.message.middleware(IsAdminMiddleware())
-router.callback_query.middleware(IsAdminMiddleware())
 
 
-@router.message(F.text.lower().in_(('ap', 'ап',)))
-@router.callback_query(lambda c: c.data == 'admin')
-async def main(event: types.Message | types.CallbackQuery, state: FSMContext) -> None:
-    admin_id = admin_user_id()
-    if admin_id is None or event.from_user.id != admin_id:
+@router.callback_query(F.data == 'admin')
+async def admin_menu(cb: types.CallbackQuery, state: FSMContext) -> None:
+    """Главное меню админки."""
+    if not is_admin(cb.from_user.id):
+        await cb.answer('Нет доступа', show_alert=True)
         return
-
+    await cb.answer()
     await state.clear()
-    text = ADMIN_MAIN_TEXT.format(name=event.from_user.full_name)
+
+    text = ADMIN_MAIN_TEXT.format(name=cb.from_user.full_name)
     markup = get_admin_main_kb()
 
-    if isinstance(event, types.CallbackQuery):
-        await event.answer()
-        msg = event.message
-        if msg.text:
-            await msg.edit_text(text=text, reply_markup=markup)
-        else:
-            await msg.delete()
-            await event.bot.send_message(
-                chat_id=msg.chat.id,
-                text=text,
-                reply_markup=markup,
-            )
+    message = cb.message
+    if not isinstance(message, types.Message) or not message.text:
+        if isinstance(message, types.Message):
+            with suppress(TelegramBadRequest):
+                await message.delete()
+        await cb.bot.send_message(
+            chat_id=cb.from_user.id,
+            text=text,
+            reply_markup=markup,
+        )
         return
 
-    await event.answer(text=text, reply_markup=markup)
+    try:
+        await message.edit_text(text=text, reply_markup=markup)
+    except TelegramBadRequest as e:
+        if 'message is not modified' in str(e).lower():
+            return
+        with suppress(TelegramBadRequest):
+            await message.delete()
+        await cb.bot.send_message(
+            chat_id=cb.from_user.id,
+            text=text,
+            reply_markup=markup,
+        )
+
+
+@router.message(Command('admin'))
+async def admin_command(msg: types.Message, state: FSMContext) -> None:
+    """Команда /admin для входа в панель управления."""
+    if not is_admin(msg.from_user.id):
+        return
+    await state.clear()
+    await msg.answer(
+        text=ADMIN_MAIN_TEXT.format(name=msg.from_user.full_name),
+        reply_markup=get_admin_main_kb(),
+    )
+

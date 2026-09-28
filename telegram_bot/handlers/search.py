@@ -2,16 +2,23 @@ from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramBadRequest
+from contextlib import suppress
 from loguru import logger
 
+from ..constants import EventType
 from ..db import send_event
 from ..keyboards import get_search_kb
 from ..middlewares import YAMServiceMiddleware
 from ..services import YAMService
+from ..utils import get_error_kb, remember_query, resolve_query
 
 router = Router()
 router.message.middleware(YAMServiceMiddleware())
 router.callback_query.middleware(YAMServiceMiddleware())
+
+NOT_FOUND_TEXT = '😔 Ничего не найдено. Попробуйте изменить запрос.'
+MAX_QUERY_LENGTH = 200
 
 
 class SearchState(StatesGroup):
@@ -25,17 +32,18 @@ async def search_command(msg: types.Message, state: FSMContext) -> None:
     await msg.answer('Введите название песни или исполнителя:')
 
 
-@router.message(SearchState.waiting_for_query)
+@router.message(SearchState.waiting_for_query, F.text)
 async def search_query(msg: types.Message, state: FSMContext, yam_service: YAMService) -> None:
     """Поиск треков по запросу (после команды /search)."""
-    await _do_search(msg, msg.text.strip(), yam_service)
     await state.clear()
+    await _do_search(msg, (msg.text or '').strip(), yam_service)
 
 
-@router.message(F.text)
+# ~F.text.startswith('/') — чтобы неизвестные команды не уходили в поиск.
+@router.message(F.text, ~F.text.startswith('/'))
 async def search_free_text(msg: types.Message, yam_service: YAMService) -> None:
     """Поиск треков по любому текстовому сообщению."""
-    await _do_search(msg, msg.text.strip(), yam_service)
+    await _do_search(msg, (msg.text or '').strip(), yam_service)
 
 
 async def _do_search(msg: types.Message, query: str, yam_service: YAMService) -> None:
@@ -44,67 +52,87 @@ async def _do_search(msg: types.Message, query: str, yam_service: YAMService) ->
         await msg.answer('Пожалуйста, введите текст для поиска.')
         return
 
+    query = query[:MAX_QUERY_LENGTH]
     logger.info(f'Пользователь {msg.from_user.id} ищет: {query!r}')
-    await send_event(event_type=1, chat_id=msg.from_user.id)
+    await send_event(event_type=EventType.SEARCH, chat_id=msg.from_user.id)
 
     searching_msg = await msg.answer('🔍 Ищу...')
 
     try:
         results = await yam_service.search(query)
-
-        if not results:
-            await searching_msg.delete()
-            await msg.answer('😔 Ничего не найдено. Попробуйте изменить запрос.')
-            return
-
-        await searching_msg.delete()
-
-        kb = get_search_kb(results)
-        if not kb:
-            await msg.answer('😔 Ничего не найдено. Попробуйте изменить запрос.')
-            return
-
-        await msg.answer(
-            f'🔍 Результаты поиска по запросу "{query}":',
-            reply_markup=kb
-        )
-
     except Exception as e:
         logger.exception(f'Ошибка при поиске: {e}')
-        await searching_msg.delete()
-        await msg.answer('❌ Произошла ошибка при поиске. Попробуйте позже.')
+        await _safe_delete(searching_msg)
+        await msg.answer(
+            '❌ Произошла ошибка при поиске. Попробуйте позже.',
+            reply_markup=get_error_kb(e, context=f'Поисковый запрос: {query}'),
+        )
+        return
+
+    await _safe_delete(searching_msg)
+
+    if not results or (not results.get('tracks') and not results.get('albums')):
+        await msg.answer(NOT_FOUND_TEXT)
+        return
 
 
-@router.callback_query(lambda c: c.data.startswith('search:'))
+    token = await remember_query(query)
+    kb = get_search_kb(results, query_token=token)
+
+    await msg.answer(
+        f'🔍 Результаты поиска по запросу "{query}":',
+        reply_markup=kb,
+    )
+
+
+async def _safe_delete(message: types.Message) -> None:
+    """Сообщение «Ищу...» могло быть удалено пользователем — это не ошибка."""
+    with suppress(TelegramBadRequest):
+        await message.delete()
+
+
+@router.callback_query(F.data.startswith('search:'))
 async def search_callback(cb: types.CallbackQuery, yam_service: YAMService) -> None:
     """Обработчик пагинации поиска."""
-    payload, page_raw = cb.data.rsplit(':', 1)
-    query = payload.removeprefix('search:')
     try:
+        _, token, page_raw = cb.data.split(':', 2)
         page = int(page_raw)
     except ValueError:
-        await cb.answer('Некорректная страница')
+        await cb.answer('Некорректные данные кнопки')
         return
-    
+
+    query = await resolve_query(token)
     if not query:
-        await cb.answer('Ошибка: не найден запрос')
+        await cb.answer('Запрос устарел — отправьте его ещё раз', show_alert=True)
         return
-    
+
     try:
         results = await yam_service.search(query, page)
-        if not results:
+        if not results or (not results.get('tracks') and not results.get('albums')):
             await cb.answer('Результаты не найдены')
             return
-        
-        kb = get_search_kb(results)
+
+
+        kb = get_search_kb(results, query_token=token)
         await cb.message.edit_reply_markup(reply_markup=kb)
         await cb.answer()
+    except TelegramBadRequest as e:
+        if 'message is not modified' in str(e).lower():
+            await cb.answer()
+            return
+        logger.warning(f'Не удалось обновить список поиска: {e}')
+        await cb.answer('Произошла ошибка')
     except Exception as e:
         logger.exception(f'Ошибка при пагинации поиска: {e}')
         await cb.answer('Произошла ошибка')
+        if cb.message:
+            await cb.message.answer(
+                '❌ Произошла ошибка при переключении страницы.',
+                reply_markup=get_error_kb(e, context=f'Пагинация поиска: {cb.data}'),
+            )
 
 
-@router.callback_query(lambda c: c.data.startswith('artist_search:'))
+@router.callback_query(F.data.startswith('artist_search:'))
 async def artist_search_callback(cb: types.CallbackQuery, yam_service: YAMService) -> None:
     """Обработчик поиска треков по артисту."""
     try:
@@ -128,6 +156,17 @@ async def artist_search_callback(cb: types.CallbackQuery, yam_service: YAMServic
         else:
             await cb.message.edit_reply_markup(reply_markup=kb)
         await cb.answer()
+    except TelegramBadRequest as e:
+        if 'message is not modified' in str(e).lower():
+            await cb.answer()
+            return
+        logger.warning(f'Не удалось показать треки исполнителя: {e}')
+        await cb.answer('Произошла ошибка')
     except Exception as e:
         logger.exception(f'Ошибка при поиске треков исполнителя: {e}')
         await cb.answer('Произошла ошибка')
+        if cb.message:
+            await cb.message.answer(
+                '❌ Произошла ошибка при поиске треков исполнителя.',
+                reply_markup=get_error_kb(e, context=f'Поиск артиста: {cb.data}'),
+            )

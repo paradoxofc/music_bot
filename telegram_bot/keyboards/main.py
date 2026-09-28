@@ -34,7 +34,7 @@ def get_top_chart_kb(chart: dict) -> InlineKeyboardMarkup:
                 callback_data=f"chart:{int(chart['page']) - 1}"
             )
         )
-    if int(chart['page']) < 9:
+    if chart.get('has_next', False):
         nav_buttons.append(
             InlineKeyboardButton(
                 text='▶️',

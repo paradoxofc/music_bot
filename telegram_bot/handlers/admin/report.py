@@ -42,12 +42,17 @@ async def report_menu(cb: types.CallbackQuery) -> None:
     await cb.message.edit_text(text=text, reply_markup=REPORT_KB)
 
 
+from ...utils import get_error_kb
+
+
 @router.callback_query(lambda c: c.data == 'admin:report:download')
 async def report_download(cb: types.CallbackQuery) -> None:
     await cb.answer('Формирую отчёт…')
     users = await get_all_users_for_report()
     if not users:
-        await cb.answer(REPORT_EMPTY_TEXT, show_alert=True)
+        # cb.answer() уже был вызван выше — повторный вызов падает с
+        # TelegramBadRequest, поэтому пишем сообщением.
+        await cb.message.answer(REPORT_EMPTY_TEXT)
         return
 
     try:
@@ -63,6 +68,9 @@ async def report_download(cb: types.CallbackQuery) -> None:
             reply_markup=REPORT_KB,
         )
         logger.info(f'Админ {cb.from_user.id} скачал отчёт ({len(users)} пользователей)')
-    except Exception:
+    except Exception as e:
         logger.exception('Ошибка при формировании Excel-отчёта')
-        await cb.answer('Не удалось сформировать отчёт', show_alert=True)
+        await cb.message.answer(
+            '❌ Не удалось сформировать отчёт. Попробуйте позже.',
+            reply_markup=get_error_kb(e, context='Формирование Excel-отчёта'),
+        )

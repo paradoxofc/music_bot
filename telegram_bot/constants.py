@@ -25,3 +25,4 @@ class EventType:
     }
 
 MAX_TG_UPLOAD = 48 * 1024 * 1024
+MIN_ALBUM_TRACKS = 4

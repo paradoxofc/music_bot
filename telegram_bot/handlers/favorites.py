@@ -5,6 +5,7 @@ from aiogram import types
 from aiogram.exceptions import TelegramBadRequest
 from loguru import logger
 
+from ..constants import EventType
 from ..db import (
     add_to_favorites as db_add_to_favorites,
     delete_from_favorites as db_delete_from_favorites,
@@ -37,7 +38,7 @@ async def add_to_favorites(cb: types.CallbackQuery, yam_service: YAMService) -> 
         title=track_title,
         artist_id=artist_id,
     )
-    await send_event(event_type=3, chat_id=cb.from_user.id)
+    await send_event(event_type=EventType.ADD_TO_FAVORITES, chat_id=cb.from_user.id)
     await cb.message.edit_reply_markup(reply_markup=get_download_kb(track_id, artist_id, True))
     await cb.answer()
 

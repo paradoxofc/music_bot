@@ -29,7 +29,11 @@ env/
 ENV/
 
 # Environment & secrets
- .env
+# ВАЖНО: раньше здесь было " .env" с ведущим пробелом — git такой шаблон
+# не применял, и настоящий .env с токенами попадал в репозиторий.
+.env
+.env.*
+!.env.example
 .env.local
 .env.*.local
 

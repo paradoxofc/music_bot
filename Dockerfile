@@ -1,22 +1,24 @@
-FROM python:3.12
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Зависимости ставим одним источником правды — из pyproject/poetry,
+# иначе список в Dockerfile расходится с pyproject и версии разъезжаются.
+COPY pyproject.toml poetry.lock* ./
+RUN pip install --no-cache-dir poetry==1.8.3 \
+    && poetry config virtualenvs.create false \
+    && poetry install --no-root --only main --no-interaction --no-ansi
+
 COPY . .
 
-RUN chmod -R a+rX . && chmod +x /app/wait-for-db.sh
-
-RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir \
-    python-dotenv==1.0.0 \
-    aiogram==3.20.0 \
-    yandex-music[async]==3.0.0 \
-    tenacity==9.1.2 \
-    redis==6.2.0 \
-    loguru==0.7.3 \
-    asyncpg==0.30.0 \
-    aiohttp==3.11.0 \
-    openpyxl==3.1.5
+RUN chmod +x /app/wait-for-db.sh
 
 CMD ["make", "run.bot"]
