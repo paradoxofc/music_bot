@@ -61,21 +61,8 @@ def setup_logging() -> None:
 
 setup_logging()
 
-import socket
-from aiohttp import TCPConnector
-from aiogram.client.session.aiohttp import AiohttpSession
-
-
-class IPv4AiohttpSession(AiohttpSession):
-    """Принудительно использует IPv4 (AF_INET) для всех запросов к Telegram API."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._connector_init['family'] = socket.AF_INET
-
-
 bot = Bot(
     TELEGRAM_BOT_TOKEN,
-    session=IPv4AiohttpSession(),
     default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
 )
 dp = Dispatcher()
