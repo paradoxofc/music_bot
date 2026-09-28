@@ -16,6 +16,13 @@ POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', '')
 POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'db')
 POSTGRES_PORT = os.getenv('POSTGRES_PORT', '5432')
 
+if POSTGRES_HOST == 'db':
+    import socket
+    try:
+        socket.gethostbyname('db')
+    except socket.gaierror:
+        POSTGRES_HOST = '127.0.0.1'
+
 _db_pool: asyncpg.Pool | None = None
 _pool_lock = asyncio.Lock()
 

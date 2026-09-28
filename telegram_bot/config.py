@@ -75,6 +75,13 @@ REDIS_PORT = _env_int('REDIS_PORT', 6379)
 REDIS_DB = _env_int('REDIS_DB', 1)
 REDIS_URL = os.getenv('REDIS_URL', f'redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}')
 
+if 'redis://redis:' in REDIS_URL:
+    import socket
+    try:
+        socket.gethostbyname('redis')
+    except socket.gaierror:
+        REDIS_URL = REDIS_URL.replace('redis://redis:', 'redis://127.0.0.1:')
+
 # Создаем подключение к Redis
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
 

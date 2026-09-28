@@ -6,10 +6,8 @@ port="${POSTGRES_PORT:-5432}"
 
 if [ "$host" != "127.0.0.1" ] && [ "$host" != "localhost" ]; then
   if ! getent hosts "$host" >/dev/null 2>&1; then
-    >&2 echo "ERROR: host '$host' not found in DNS."
-    >&2 echo "Ensure 'db' service is Up and bot is on the same network."
-    >&2 echo "Run: docker compose -f docker-compose.prod.yml ps"
-    exit 1
+    >&2 echo "INFO: host '$host' not found in DNS, falling back to 127.0.0.1 (host network mode)"
+    host="127.0.0.1"
   fi
 fi
 
