@@ -119,11 +119,6 @@ dp.inline_query.middleware(op_subscription)
 
 
 async def on_startup() -> None:
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info('Старый webhook сброшен (polling запущен)')
-    except Exception as e:
-        logger.warning(f'Не удалось сбросить webhook: {e}')
     await init_db_pool()
     await init_yam_service()
     start_reminder_scheduler(bot)

@@ -67,18 +67,6 @@ async def command_start(
         await send_album_card(msg, album_id, yam_service)
         return
 
-    if START_GIF_URL:
-        try:
-            await msg.answer_animation(
-                animation=START_GIF_URL,
-                caption=MAIN_TEXT,
-                reply_markup=get_main_kb(),
-                disable_notification=True
-            )
-            return
-        except Exception as exc:
-            logger.warning(f"Ошибка при отправке анимации START_GIF_URL: {exc}")
-
     await msg.answer(
         text=MAIN_TEXT,
         reply_markup=get_main_kb(),
@@ -178,17 +166,6 @@ async def reminder_fix_button(cb: types.CallbackQuery, state: FSMContext) -> Non
     await cb.answer('Погнали! 🎵')
     with suppress(TelegramBadRequest):
         await cb.message.delete()
-    if START_GIF_URL:
-        try:
-            await cb.message.answer_animation(
-                animation=START_GIF_URL,
-                caption=MAIN_TEXT,
-                reply_markup=get_main_kb(),
-            )
-            return
-        except Exception as exc:
-            logger.warning(f"Ошибка при отправке анимации в reminder_fix_button: {exc}")
-
     await cb.message.answer(
         text=MAIN_TEXT,
         reply_markup=get_main_kb(),
