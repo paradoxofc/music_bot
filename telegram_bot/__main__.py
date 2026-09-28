@@ -61,8 +61,19 @@ def setup_logging() -> None:
 
 setup_logging()
 
+from aiogram.client.session.aiohttp import AiohttpSession
+
+
+class DirectAiohttpSession(AiohttpSession):
+    """Отключает aiohappyeyeballs, вызывающий таймауты и отмену корутин на dual-stack VPS."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._connector_init['happy_eyeballs_delay'] = None
+
+
 bot = Bot(
     TELEGRAM_BOT_TOKEN,
+    session=DirectAiohttpSession(),
     default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
 )
 dp = Dispatcher()
@@ -122,10 +133,7 @@ async def on_startup() -> None:
     await init_db_pool()
     await init_yam_service()
     start_reminder_scheduler(bot)
-    try:
-        await bot.set_my_commands(BOT_COMMANDS)
-    except Exception as e:
-        logger.warning(f'Не удалось установить меню команд: {e}')
+    asyncio.create_task(bot.set_my_commands(BOT_COMMANDS))
 
 
 async def on_shutdown() -> None:
