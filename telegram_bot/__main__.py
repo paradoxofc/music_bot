@@ -62,18 +62,15 @@ def setup_logging() -> None:
 setup_logging()
 
 import socket
-from aiohttp import ClientSession, TCPConnector
+from aiohttp import TCPConnector
 from aiogram.client.session.aiohttp import AiohttpSession
 
 
 class IPv4AiohttpSession(AiohttpSession):
-    """Принудительно использует IPv4 (AF_INET) для всех запросов к Telegram API.
-    Предотвращает таймауты из-за неработающей маршрутизации IPv6 на VPS."""
-    async def create_session(self) -> ClientSession:
-        return ClientSession(
-            connector=TCPConnector(family=socket.AF_INET),
-            json_serialize=self.json_dumps,
-        )
+    """Принудительно использует IPv4 (AF_INET) для всех запросов к Telegram API."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._connector_init['family'] = socket.AF_INET
 
 
 bot = Bot(
@@ -171,6 +168,7 @@ async def main() -> None:
         logger.debug('ADMIN_CHAT_ID={}', admin_user_id())
 
     await on_startup()
+    logger.info('🚀 Бот успешно подключен к Telegram и ожидает сообщений!')
     try:
         await dp.start_polling(
             bot,
