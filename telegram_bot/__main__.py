@@ -61,13 +61,15 @@ def setup_logging() -> None:
 
 setup_logging()
 
+import socket
 from aiogram.client.session.aiohttp import AiohttpSession
 
 
 class DirectAiohttpSession(AiohttpSession):
-    """Отключает aiohappyeyeballs, вызывающий таймауты и отмену корутин на dual-stack VPS."""
+    """Использует прямой IPv4 коннектор без aiohappyeyeballs."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._connector_init['family'] = socket.AF_INET
         self._connector_init['happy_eyeballs_delay'] = None
 
 
@@ -129,11 +131,19 @@ dp.inline_query.middleware(op_subscription)
 
 
 
+async def _safe_set_commands() -> None:
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+        logger.info('Меню команд бота обновлено')
+    except Exception as e:
+        logger.warning(f'Не удалось обновить меню команд: {e}')
+
+
 async def on_startup() -> None:
     await init_db_pool()
     await init_yam_service()
     start_reminder_scheduler(bot)
-    asyncio.create_task(bot.set_my_commands(BOT_COMMANDS))
+    asyncio.create_task(_safe_set_commands())
 
 
 async def on_shutdown() -> None:
