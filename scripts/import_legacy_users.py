@@ -23,7 +23,11 @@ import asyncpg
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_INPUT = ROOT / 'search_muzyka_bot_active.txt'
+DEFAULT_INPUT = (
+    ROOT / 'search_muzyka_bot_live.txt'
+    if (ROOT / 'search_muzyka_bot_live.txt').exists()
+    else ROOT / 'search_muzyka_bot_active.txt'
+)
 SOURCE = 'legacy_import'
 BATCH_SIZE = 500
 
@@ -71,11 +75,19 @@ async def ensure_users_table(conn: asyncpg.Connection) -> None:
 
 
 async def import_ids(ids: list[int], *, dry_run: bool) -> None:
+    host = os.environ.get('POSTGRES_HOST', '127.0.0.1')
+    if host == 'db':
+        import socket
+        try:
+            socket.gethostbyname('db')
+        except socket.gaierror:
+            host = '127.0.0.1'
+
     conn = await asyncpg.connect(
-        database=os.environ['POSTGRES_DB'],
-        user=os.environ['POSTGRES_USER'],
-        password=os.environ['POSTGRES_PASSWORD'],
-        host=os.environ['POSTGRES_HOST'],
+        database=os.environ.get('POSTGRES_DB', 'mus_db'),
+        user=os.environ.get('POSTGRES_USER', 'admin'),
+        password=os.environ.get('POSTGRES_PASSWORD', ''),
+        host=host,
         port=int(os.environ.get('POSTGRES_PORT', '5432')),
     )
     try:
